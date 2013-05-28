@@ -13,6 +13,7 @@ config ARCH_SOCFPGA
 	select HAVE_ARM_SCU
 	select HAVE_SMP
 	select MIGHT_HAVE_CACHE_L2X0
+	select MIGHT_HAVE_PCI
 	select SPARSE_IRQ
 	select USE_OF
 

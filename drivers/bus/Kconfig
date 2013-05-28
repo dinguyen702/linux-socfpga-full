@@ -18,4 +18,11 @@ config OMAP_INTERCONNECT
 
 	help
 	  Driver to enable OMAP interconnect error handling driver.
+
+config ALTERA_PCIE_RP
+        tristate "Altera PCIe Root Port Driver"
+        depends on PCI
+        help
+          The Altera PCI Express Root Port driver.
+
 endmenu

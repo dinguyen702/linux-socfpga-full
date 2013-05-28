@@ -1,0 +1,21 @@
+* Altera PCI Express Root Port
+
+Altera FPGA include of PCIe RP IP
+
+properties:
+- compatible : "altr,pcie-root-port-1.0"
+- reg, cra or txs : bases for CTA and TXS
+- interrupts : interrupt connection
+
+Example
+	pcie_cv_hip_avmm_0: pcie@0x0 {
+		compatible = "altr,pcie-root-port-1.0";
+		reg = < 0x00000000 0x20000000 >;
+		cra = < 0xFF240000 0x00004000 >;
+		/* txs = < 0xC0000000 0x20000000 >; */
+		interrupt-parent = < &hps_0_arm_gic_0 >;
+		interrupts = < 0 43 4 >;
+		interrupt-controller;
+		#interrupt-cells = < 1 >;
+	}; //end pcie@0x0 (pcie_cv_hip_avmm_0)
+
