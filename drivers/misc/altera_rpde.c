@@ -1,18 +1,17 @@
 /*
- *  Copyright (C) 2013 Altera Corporation
+ * Copyright Altera Corporation (C) 2013. All Rights Reserved.
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * You should have received a copy of the GNU General Public License along with
+ * this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -46,20 +45,21 @@ struct block_device_t {
 	void __iomem   *rpdata;
 	unsigned long  rpdata_avoff;
 	unsigned long  datlen;
-	void __iomem   *rpdmacsr;
-	void __iomem   *rpdmades;
+	void __iomem   *dmacsr;
+	void __iomem   *dmades;
 	unsigned int   rphwirq;
 	void __iomem   *epdata;
 	unsigned long  epdata_avoff;
+	char           *sys_buf;
+	unsigned long  sys_buf_phys;
 	void __iomem   *perfcounter;
+	unsigned long  timediff;
+	unsigned long  perfcountertick;
+	unsigned int   dmaxfer_cmd;
+	unsigned int   dma_transfer_completed;
 	struct gendisk *gd;
 };
 static struct block_device_t block_device;
-
-/* time measurement */
-static unsigned long timediff;
-static unsigned long perfcountertick;
-static int rpdma_transfer_completed;
 
 /* Support only one DES */
 static void init_msgdma_xfer(void __iomem *dmades, unsigned long frphy,
@@ -71,9 +71,11 @@ static void init_msgdma_xfer(void __iomem *dmades, unsigned long frphy,
 
 	/* record start time */
 	/* reset */
-	writel(1, block_device.perfcounter);
+	writel(PERFCTR_GBL_CLK_CTR_LO_RST,
+		block_device.perfcounter + PERFCTR_GBL_CLK_CTR_LO);
 	/* start */
-	writel(0, block_device.perfcounter + 4);
+	writel(PERFCTR_GBL_CLK_CTR_HI_START,
+		block_device.perfcounter + PERFCTR_GBL_CLK_CTR_HI);
 
 	/* start transfer */
 	writel(MSGDMA_DES_CTL_TX_CH   |
@@ -95,57 +97,102 @@ static void init_msgdma_csr(void __iomem *dmacsr)
 	MSGDMA_ENA_CTL(dmacsr);
 }
 
+/* MSGDMA transfer function
+ *   return timediff from performance counter
+ */
+static unsigned long msgdma_transfer(unsigned long frphy, unsigned long tophy,
+				     u32 size32)
+{
+	unsigned long rt;
+
+	/* Setup performance counter and barrier */
+	block_device.perfcountertick = 0;
+	block_device.dma_transfer_completed = 0;
+
+	/* Setting up SGDMA CSR */
+	init_msgdma_csr(block_device.dmacsr);
+
+	/* Init SGDMA transfer */
+	init_msgdma_xfer(block_device.dmades,
+			 frphy, tophy, size32);
+
+	/* wait DMA transfer complete */
+	while (block_device.dma_transfer_completed == 0)
+		mb();
+
+	rt = (block_device.perfcountertick / RP_PERFCOUNTER_MFREQ);  /* usec */
+
+	return rt;
+}
+
 static int block_ioctl(struct block_device *bdev, fmode_t mode,
 		       unsigned int cmd, unsigned long arg)
 {
 	int rt;
-	unsigned long count;
+	struct ioctl_t ioctl_data;
+	unsigned long sys_buf_avoff;
 
-	switch(cmd) {
+	block_device.rpdata_avoff = RP_OCRAM_AVOFF;
+	sys_buf_avoff = block_device.sys_buf_phys + RP_AS_DMA2F2H_AVOFF;
+
+	switch (cmd) {
 	case GET_IOCTL:
 		return copy_to_user((void *)arg,
 				    (void *)&block_device.datlen,
 				    sizeof(long));
-	case READ_IOCTL:
-		/* wait DMA transfer complete */
-		count = ~0UL;
-		while (rpdma_transfer_completed == 0) {
-			if (count-- == 0) {
-				printk(KERN_NOTICE
-					"RP interrupt fail\n");
-				return -ENOTTY;
-			}
-			barrier();
-		}
-		rpdma_transfer_completed = 0;
-		timediff = perfcountertick / RP_PERFCOUNTER_MFREQ;  /* usec */
-		rt = copy_to_user((void *)arg, (void *)&timediff, sizeof(long));
+	case SET_IOCTL:
+		return copy_from_user((void *)&block_device.dmaxfer_cmd,
+					  (void *)arg,
+				      sizeof(int));
+	case PCI_RX_IOCTL:
+		/* From EP On-Chip RAM to RP On-Chip RAM using SGDMA */
+		memset(block_device.rpdata, 0, block_device.datlen);
+		ioctl_data.datlen = block_device.datlen;
+		ioctl_data.timediff = msgdma_transfer(block_device.epdata_avoff,
+						      block_device.rpdata_avoff,
+						      block_device.datlen);
+		rt = copy_to_user((void *)arg, (void *)&ioctl_data,
+				  sizeof(struct ioctl_t));
 		return rt;
-	case WRITE_IOCTL:
-		/* set timediff */
-		rt = copy_from_user((void *)&perfcountertick, (void *)arg,
-				    sizeof(long));
-		if (rt)
-			return rt;
+	case PCI_TX_IOCTL:
 		/* From RP On-Chip RAM to EP On-Chip RAM using SGDMA */
-		rpdma_transfer_completed = 0;
-		/* Setting up SGDMA CSR */
-		init_msgdma_csr(block_device.rpdmacsr);
-		/* Init SGDMA transfer */
-		init_msgdma_xfer(block_device.rpdmades,
-			       block_device.rpdata_avoff,
-			       block_device.epdata_avoff,
-			       block_device.datlen);
+		memset(block_device.epdata, 0, block_device.datlen);
+		ioctl_data.datlen = block_device.datlen;
+		ioctl_data.timediff = msgdma_transfer(block_device.rpdata_avoff,
+						      block_device.epdata_avoff,
+						      block_device.datlen);
+		rt = copy_to_user((void *)arg, (void *)&ioctl_data,
+				  sizeof(struct ioctl_t));
+		return rt;
+	case SYS_RX_IOCTL:
+		/* From EP On-Chip RAM to RP System Memory using SGDMA */
+		memset(block_device.sys_buf, 0, block_device.datlen);
+		ioctl_data.datlen = block_device.datlen;
+		ioctl_data.timediff = msgdma_transfer(block_device.epdata_avoff,
+						      sys_buf_avoff,
+						      block_device.datlen);
+		rt = copy_to_user((void *)arg, (void *)&ioctl_data,
+				  sizeof(struct ioctl_t));
+		return rt;
+	case SYS_TX_IOCTL:
+		/* From RP System Memory to EP On-Chip RAM using SGDMA */
+		memset(block_device.epdata, 0, block_device.datlen);
+		ioctl_data.datlen = block_device.datlen;
+		ioctl_data.timediff = msgdma_transfer(sys_buf_avoff,
+						      block_device.epdata_avoff,
+						      block_device.datlen);
+		rt = copy_to_user((void *)arg, (void *)&ioctl_data,
+				  sizeof(struct ioctl_t));
 		return rt;
 	}
 
 	return -ENOTTY;
 }
 
-static struct request_queue *block_queue = NULL;
-static struct block_device_operations block_fops = {
-    .owner	= THIS_MODULE,
-    .ioctl	= block_ioctl,
+static struct request_queue *block_queue;
+static const struct block_device_operations block_fops = {
+	.owner = THIS_MODULE,
+	.ioctl = block_ioctl,
 };
 
 static void blk_request(struct request_queue *rq)
@@ -156,9 +203,8 @@ static void blk_request(struct request_queue *rq)
 
 	req = blk_fetch_request(rq);
 	while (req) {
-		if (req->cmd_type != REQ_TYPE_FS) {
+		if (req->cmd_type != REQ_TYPE_FS)
 			continue;
-		}
 
 		offset = blk_rq_pos(req) * SECTOR_SIZE;
 		nbytes = blk_rq_cur_sectors(req) * SECTOR_SIZE;
@@ -166,29 +212,60 @@ static void blk_request(struct request_queue *rq)
 		err = -EIO;
 		if ((offset + nbytes) <= block_device.datlen) {
 			err = 0;
-			switch(rq_data_dir(req)) {
+			switch (rq_data_dir(req)) {
 			case READ:
-				/* Read from RP On-Chip RAM to Buffer */
-				memcpy(req->buffer,
-				       block_device.rpdata + offset,
-				       nbytes);
+				switch (block_device.dmaxfer_cmd) {
+				case PCI_RX_IOCTL:
+					/* Read from RP On-Chip RAM to Buffer */
+					memcpy(req->buffer,
+						block_device.rpdata + offset,
+						nbytes);
+					break;
+				case SYS_RX_IOCTL:
+					/* Read from System Buffer to Buffer */
+					memcpy(req->buffer,
+						block_device.sys_buf + offset,
+						nbytes);
+					break;
+				case PCI_TX_IOCTL:
+				case SYS_TX_IOCTL:
+					/* Read from EP On-Chip RAM to Buffer */
+					memcpy(req->buffer,
+						block_device.epdata + offset,
+						nbytes);
+					break;
+				}
 				break;
 			case WRITE:
-				/* Write from Buffer to RP On-Chip RAM */
-				memcpy(block_device.rpdata + offset,
-				       req->buffer, nbytes);
+				switch (block_device.dmaxfer_cmd) {
+				case PCI_RX_IOCTL:
+				case SYS_RX_IOCTL:
+					/* Write from Buffer to EP OCM */
+					memcpy(block_device.epdata + offset,
+						req->buffer, nbytes);
+					break;
+				case PCI_TX_IOCTL:
+					/* Write from Buffer to RP OCM */
+					memcpy(block_device.rpdata + offset,
+						req->buffer, nbytes);
+					break;
+				case SYS_TX_IOCTL:
+					/* Write from Buffer to System Buffer */
+					memcpy(block_device.sys_buf + offset,
+						req->buffer, nbytes);
+					break;
+				}
 				break;
 			default:
 				err = -EIO;
-				printk(KERN_NOTICE "Unknown request %u\n",
+				pr_notice("Unknown request %u\n",
 				       rq_data_dir(req));
 				break;
 			}
 		}
 
-		if (__blk_end_request_cur(req, err) == 0) {
+		if (__blk_end_request_cur(req, err) == 0)
 			req = blk_fetch_request(rq);
-		}
 	}
 }
 
@@ -199,22 +276,22 @@ static int block_device_init(struct pci_dev *pdev)
 	/* register as block device */
 	err = register_blkdev(MAJOR_NR, DEVICE_NAME);
 	if (err) {
+		pr_err("block device fail to register\n");
 		goto err_ret;
 	}
 
 	spin_lock_init(&block_device.lock);
 
-	block_queue = blk_init_queue(blk_request,&block_device.lock);
+	block_queue = blk_init_queue(blk_request, &block_device.lock);
 	if (block_queue == NULL) {
-		printk(KERN_WARNING
-		       "block_device: error in blk_init_queue\n");
+		pr_warn("block_device: error in blk_init_queue\n");
 		goto err_unregdev;
 	}
 
+	/* whole disk, no partition */
 	block_device.gd = alloc_disk(1);
 	if (!block_device.gd) {
-		printk(KERN_WARNING
-		       "block_device: error in alloc_disk\n");
+		pr_warn("block_device: error in alloc_disk\n");
 		goto err_deinit_queue;
 	}
 
@@ -241,32 +318,47 @@ err_ret:
 
 static irqreturn_t driver_isr(int irq, void *arg)
 {
-	/* make posted write complete */
-	while (memcmp((block_device.rpdata + block_device.datlen - 4),
-	              (block_device.epdata + block_device.datlen - 4),
-	              4));
+	/* make last 4 bytes posted write complete */
+	switch (block_device.dmaxfer_cmd) {
+	case PCI_RX_IOCTL:
+	case PCI_TX_IOCTL:
+		while (memcmp((block_device.rpdata + block_device.datlen - 4),
+			      (block_device.epdata + block_device.datlen - 4),
+			      4))
+			;
+		break;
+	case SYS_RX_IOCTL:
+	case SYS_TX_IOCTL:
+		while (memcmp((block_device.sys_buf + block_device.datlen - 4),
+			      (block_device.epdata + block_device.datlen - 4),
+			      4))
+			;
+		break;
+	}
 
 	/* record end time */
 	/* stop */
-	__raw_writel(0, block_device.perfcounter);
+	__raw_writel(PERFCTR_GBL_CLK_CTR_LO_STOP,
+		block_device.perfcounter + PERFCTR_GBL_CLK_CTR_LO);
 
 	/* Clear Interrupt and RUN bits */
-	__raw_writel((__raw_readl(block_device.rpdmacsr + MSGDMA_CTL)
-		                  | MSGDMA_CTL_DIS_BITS)
-		                  & ~MSGDMA_CTL_IE_GLOBAL,
-		     block_device.rpdmacsr + MSGDMA_CTL);
+	__raw_writel((__raw_readl(block_device.dmacsr + MSGDMA_CTL)
+				  | MSGDMA_CTL_DIS_BITS)
+				  & ~MSGDMA_CTL_IE_GLOBAL,
+		     block_device.dmacsr + MSGDMA_CTL);
 
-	if (__raw_readl(block_device.rpdmacsr + MSGDMA_STS) & MSGDMA_STS_IRQ)
+	if (__raw_readl(block_device.dmacsr + MSGDMA_STS) & MSGDMA_STS_IRQ)
 		/* read tick */
-		perfcountertick = readl(block_device.perfcounter);
+		block_device.perfcountertick = readl(block_device.perfcounter +
+						     PERFCTR_GBL_CLK_CTR_LO);
 	else
-		pr_err("msgdma transfer error\n");
+		pr_err("msgdma IRQ not triggered\n");
 
 	/* Clear any SDGMA STS */
-	__raw_writel(MSGDMA_STS_CLR_BITS, block_device.rpdmacsr + MSGDMA_STS);
+	__raw_writel(MSGDMA_STS_CLR_BITS, block_device.dmacsr + MSGDMA_STS);
 
 	/* completed */
-	rpdma_transfer_completed = 1;
+	block_device.dma_transfer_completed = 1;
 
 	return IRQ_HANDLED;
 }
@@ -318,37 +410,59 @@ static int __devinit altr_rpde_pci_probe(struct pci_dev *pdev,
 	}
 	block_device.epdata_avoff = EP_OCRAM_BAR_AVOFF;
 	block_device.epdata =
-		   remap_pci_mem(pci_resource_start(lpdev, EP_DIR_BAR_NR)
-					 + EP_OCRAM_BAR_AVOFF,
-		   		 block_device.datlen);
-	if (block_device.epdata == NULL)
+		remap_pci_mem(pci_resource_start(lpdev, EP_DIR_BAR_NR)
+			      + EP_OCRAM_BAR_AVOFF,
+			      block_device.datlen);
+	if (block_device.epdata == NULL) {
+		pr_err("fail to ioremap epdata\n");
 		goto err_nodev;
+	}
 
 	/*********** RP Setup ***********/
 
 	/* Request RP On-Chip RAM region */
 	if (!request_mem_region(RP_OCRAM_SBASE, RP_OCRAM_SIZE,
-				DRIVER_NAME))
+				DRIVER_NAME)) {
+		pr_err("fail to request RP OCM region\n");
 		goto err_unmapep;
+	}
 	/* IO Map RP On-Chip RAM region*/
-	block_device.rpdata_avoff = RP_OCRAM_AVOFF;
-	if ((block_device.rpdata = ioremap_nocache(RP_OCRAM_SBASE,
-					  block_device.datlen)) == NULL)
+	block_device.rpdata = ioremap_nocache(RP_OCRAM_SBASE,
+					      block_device.datlen);
+	if (block_device.rpdata == NULL) {
+		pr_err("fail to ioremap rpdata\n");
 		goto err_freeocr;
+	}
 	/* IO Map RP DMA CSR */
-	if ((block_device.rpdmacsr = ioremap_nocache(RP_DMA_CSR_SBASE,
-					    RP_DMA_CSR_SIZE)) == NULL)
+	block_device.dmacsr = ioremap_nocache(RP_DMA_CSR_SBASE,
+					      RP_DMA_CSR_SIZE);
+	if (block_device.dmacsr == NULL) {
+		pr_err("fail to ioremap DMA CSR region\n");
 		goto err_unmapocr;
+	}
 	/* IO Map RP DMA DES */
-	if ((block_device.rpdmades = ioremap_nocache(RP_DMA_DES_SBASE,
-					    RP_DMA_DES_SIZE)) == NULL)
+	block_device.dmades = ioremap_nocache(RP_DMA_DES_SBASE,
+					      RP_DMA_DES_SIZE);
+	if (block_device.dmades == NULL) {
+		pr_err("fail to ioremap DMA DES region\n");
 		goto err_unmapdmacsr;
+	}
 	/* IO Map RP Performance Counter */
-	if ((block_device.perfcounter = ioremap_nocache(RP_PERFCOUNTER_SBASE,
-					    RP_PERFCOUNTER_SIZE)) == NULL)
+	block_device.perfcounter = ioremap_nocache(RP_PERFCOUNTER_SBASE,
+						   RP_PERFCOUNTER_SIZE);
+	if (block_device.perfcounter == NULL) {
+		pr_err("fail to ioremap performance counter region\n");
 		goto err_unmapdmades;
+	}
 
 	/*********** SGDMA IRQ Setup ***********/
+	/* verify if SGDMA status ok */
+	writel(~0UL, block_device.dmacsr + MSGDMA_STS);
+	if ((readl(block_device.dmacsr + MSGDMA_STS) & MSGDMA_STS_MASK) !=
+	    MSGDMA_STS_AT_RESET) {
+		pr_err("RP MSGDMA fail status test\n");
+		goto err_unmapperfcounter;
+	}
 
 	/* SGDMA IRQ */
 	node = of_find_matching_node(NULL, altrpcie_ids);
@@ -359,13 +473,11 @@ static int __devinit altr_rpde_pci_probe(struct pci_dev *pdev,
 			pr_err("RPDE failed to register legacy IRQ\n");
 			goto err_unmapperfcounter;
 		} else {
-			timediff = 0;
-			wmb();
-			rpdma_transfer_completed = 1;
+			block_device.timediff = 0;
 			set_irq_flags(block_device.rphwirq, IRQF_VALID);
 		}
 	} else {
-		printk(KERN_NOTICE "No SGDMA found in Device Tree\n");
+		pr_notice("No SGDMA found in Device Tree\n");
 		goto err_unmapperfcounter;
 	}
 
@@ -373,19 +485,32 @@ static int __devinit altr_rpde_pci_probe(struct pci_dev *pdev,
 
 	/* Init block device API */
 	err = block_device_init(pdev);
-	if (err)
+	if (err) {
+		pr_err("fail to init block device\n");
 		goto err_freeirq;
+	}
+
+	/* Allocate system memory for DMA trasfer */
+	block_device.sys_buf = kmalloc(block_device.datlen,
+				       GFP_DMA | GFP_ATOMIC);
+	if (!block_device.sys_buf) {
+		pr_notice("Fail to allocate system memory for DMA\n");
+		goto err_unregblk;
+	}
+	block_device.sys_buf_phys = virt_to_phys(block_device.sys_buf);
 
 	pci_dev_put(lpdev);
 	return 0;
+err_unregblk:
+	unregister_blkdev(MAJOR_NR, DEVICE_NAME);
 err_freeirq:
 	free_irq(block_device.rphwirq, pdev);
 err_unmapperfcounter:
 	iounmap(block_device.perfcounter);
 err_unmapdmades:
-	iounmap(block_device.rpdmades);
+	iounmap(block_device.dmades);
 err_unmapdmacsr:
-	iounmap(block_device.rpdmacsr);
+	iounmap(block_device.dmacsr);
 err_unmapocr:
 	iounmap(block_device.rpdata);
 err_freeocr:
@@ -399,17 +524,18 @@ err_nodev:
 
 static void __devexit altr_rpde_pci_remove(struct pci_dev *pdev)
 {
+	kfree(block_device.sys_buf);
 	blk_cleanup_queue(block_queue);
 	unregister_blkdev(MAJOR_NR, DEVICE_NAME);
 	free_irq(pdev->irq, pdev);
-	iounmap(block_device.rpdmacsr);
-	iounmap(block_device.rpdmades);
+	iounmap(block_device.dmacsr);
+	iounmap(block_device.dmades);
 	iounmap(block_device.rpdata);
 	release_mem_region(RP_OCRAM_SBASE, RP_OCRAM_SIZE);
 	return;
 }
 
-static struct pci_device_id altr_rpde_pci_tbl[] = {
+static DEFINE_PCI_DEVICE_TABLE(altr_rpde_pci_tbl) = {
 	{ PCI_VENDOR_ID_RPDE, PCI_DEVICE_ID_RPDE,
 	  PCI_SUBVEN_ID_RPDE, PCI_SUBDEV_ID_RPDE,
 	  0, 0, 0 },
